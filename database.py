@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class Database:
     def __init__(self):
         url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_SERVICE_KEY")
+        key = os.getenv("sb_publishable_NDEYUgrlMjBnXAbsVBAnoQ_cKiE275D")
         if not url or not key:
             raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in .env")
         self.client: Client = create_client(url, key)
