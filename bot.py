@@ -1,22 +1,16 @@
 """
 bot.py — Telegram Business Bot
-Handles auto-replies, paid content, broadcasts and stats
-via Telegram Business API.
+Auto-replies only to a user's FIRST ever message,
+with realistic typing simulation before each message.
 """
 
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from telegram import (
-    Update,
-    InputPaidMediaPhoto,
-    InputPaidMediaVideo,
-    InputMediaPhoto,
-)
-from telegram.constants import ParseMode
+from telegram import Update
+from telegram.constants import ChatAction, ParseMode
 from telegram.error import TelegramError, Forbidden
 from telegram.ext import (
     Application,
@@ -28,7 +22,13 @@ from telegram.ext import (
     filters,
 )
 
-from config import REPLY_SEQUENCE, FALLBACK_REPLY, MAX_DELAY_SECONDS
+from config import (
+    MSG_1_DELAY,
+    MSG_2_DELAY,
+    MESSAGE_1,
+    MESSAGE_2,
+    TYPING_SPEED,
+)
 from database import Database
 
 load_dotenv()
@@ -38,17 +38,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── In-memory store: business_connection_id → owner_user_id ──────────────────
-# Populated at startup from DB + updated live as connections arrive
-active_connections: dict[str, int] = {}  # bc_id → owner_id
+# ── In-memory: bc_id → owner_id ───────────────────────────────────────────────
+active_connections: dict[str, int] = {}
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  STARTUP
+#  STARTUP — restore connections from DB
 # ════════════════════════════════════════════════════════════════════════
 
 async def on_startup(app: Application):
-    """Restore business connections from database on bot restart."""
     db: Database = app.bot_data["db"]
     rows = db.get_active_connections()
     for row in rows:
@@ -57,23 +55,19 @@ async def on_startup(app: Application):
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  BUSINESS CONNECTION HANDLER
+#  BUSINESS CONNECTION
 # ════════════════════════════════════════════════════════════════════════
 
 async def handle_business_connection(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    """
-    Fires when a Telegram Business account connects or disconnects the bot.
-    Telegram → Settings → Business → Chatbots → select this bot.
-    """
     bc = update.business_connection
     db: Database = context.bot_data["db"]
 
     if bc.is_enabled:
         active_connections[bc.id] = bc.user.id
         db.save_business_connection(bc.id, bc.user.id, is_enabled=True)
-        logger.info(f"✅ Business connected | bc_id={bc.id} owner={bc.user.id}")
+        logger.info(f"✅ Business connected | bc_id={bc.id} | owner={bc.user.id}")
     else:
         active_connections.pop(bc.id, None)
         db.save_business_connection(bc.id, bc.user.id, is_enabled=False)
@@ -81,104 +75,37 @@ async def handle_business_connection(
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  BUSINESS MESSAGE HANDLER  (auto-reply engine)
+#  TYPING SIMULATOR
+#  Shows "typing…" indicator for a duration based on message length,
+#  refreshing every 4s (Telegram clears it after 5s automatically).
 # ════════════════════════════════════════════════════════════════════════
 
-async def handle_business_message(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
+async def simulate_typing(context, chat_id: int, bc_id: str, text: str):
     """
-    Fires for every message in a business chat.
-    Only auto-replies to INCOMING messages from non-owners.
+    Show a realistic typing indicator before sending a message.
+    Duration = len(text) / TYPING_SPEED seconds, minimum 1.5s.
     """
-    message = update.business_message
-    if not message:
-        return
+    duration = max(len(text) / TYPING_SPEED, 1.5)
+    elapsed = 0.0
 
-    bc_id = message.business_connection_id
-    sender = message.from_user
-
-    # ── Skip messages sent BY the business owner themselves ──────────────
-    owner_id = active_connections.get(bc_id)
-    if owner_id and sender.id == owner_id:
-        return  # Owner typed this — don't auto-reply
-
-    db: Database = context.bot_data["db"]
-
-    # ── Track user & get their message count ─────────────────────────────
-    msg_count = db.upsert_user(sender, bc_id)
-    logger.info(
-        f"💬 User {sender.id} (@{sender.username}) | msg #{msg_count} "
-        f"| chat {message.chat_id}"
-    )
-
-    # ── Find the matching reply step ──────────────────────────────────────
-    step_config = next(
-        (s for s in REPLY_SEQUENCE if s["step"] == msg_count), None
-    )
-
-    if step_config is None:
-        # Beyond defined sequence — use fallback
-        if FALLBACK_REPLY:
-            await asyncio.sleep(1)
-            await send_text(
-                context,
-                chat_id=message.chat_id,
-                bc_id=bc_id,
-                text=FALLBACK_REPLY.format(
-                    name=sender.first_name or "there",
-                    username=f"@{sender.username}" if sender.username else "",
-                ),
-            )
-        return
-
-    # ── Apply delay ───────────────────────────────────────────────────────
-    delay = min(step_config.get("delay", 0), MAX_DELAY_SECONDS)
-    if delay > 0:
-        await asyncio.sleep(delay)
-
-    # ── Dispatch reply by type ────────────────────────────────────────────
-    reply_type = step_config.get("type", "text")
-
-    try:
-        if reply_type == "text":
-            text = step_config["content"].format(
-                name=sender.first_name or "there",
-                username=f"@{sender.username}" if sender.username else "",
-            )
-            await send_text(context, message.chat_id, bc_id, text)
-
-        elif reply_type == "photo":
-            await send_photo(
-                context,
-                chat_id=message.chat_id,
-                bc_id=bc_id,
-                photo=step_config["media"],
-                caption=step_config.get("caption", ""),
-            )
-
-        elif reply_type == "paid_media":
-            await send_paid_media(
-                context,
-                chat_id=message.chat_id,
-                bc_id=bc_id,
-                star_count=step_config["star_count"],
-                media_list=step_config["media"],
-                caption=step_config.get("caption", "🔒 Unlock with Stars"),
-            )
-
-        else:
-            logger.warning(f"Unknown reply type: {reply_type}")
-
-    except TelegramError as e:
-        logger.error(f"Failed to send reply to {sender.id}: {e}")
+    while elapsed < duration:
+        await context.bot.send_chat_action(
+            chat_id=chat_id,
+            action=ChatAction.TYPING,
+            business_connection_id=bc_id,
+        )
+        tick = min(4.0, duration - elapsed)   # refresh before 5s expiry
+        await asyncio.sleep(tick)
+        elapsed += tick
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  SEND HELPERS
+#  SEND HELPER — typing then message
 # ════════════════════════════════════════════════════════════════════════
 
-async def send_text(context, chat_id, bc_id, text):
+async def type_and_send(context, chat_id: int, bc_id: str, text: str):
+    """Simulate typing then send the message."""
+    await simulate_typing(context, chat_id, bc_id, text)
     await context.bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -187,40 +114,56 @@ async def send_text(context, chat_id, bc_id, text):
     )
 
 
-async def send_photo(context, chat_id, bc_id, photo, caption=""):
-    await context.bot.send_photo(
-        chat_id=chat_id,
-        photo=photo,
-        caption=caption,
-        business_connection_id=bc_id,
-        parse_mode=ParseMode.HTML,
+# ════════════════════════════════════════════════════════════════════════
+#  BUSINESS MESSAGE HANDLER
+# ════════════════════════════════════════════════════════════════════════
+
+async def handle_business_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    message = update.business_message
+    if not message:
+        return
+
+    bc_id  = message.business_connection_id
+    sender = message.from_user
+
+    # ── Ignore messages sent by the business owner themselves ────────────
+    owner_id = active_connections.get(bc_id)
+    if owner_id and sender.id == owner_id:
+        return
+
+    db: Database = context.bot_data["db"]
+
+    # ── Upsert user — returns new message_count ───────────────────────────
+    msg_count = db.upsert_user(sender, bc_id)
+    logger.info(
+        f"💬 User {sender.id} (@{sender.username}) | "
+        f"msg #{msg_count} | chat {message.chat_id}"
     )
 
+    # ── Only auto-reply on their VERY FIRST message ───────────────────────
+    if msg_count != 1:
+        return   # repeat message — you handle it manually
 
-async def send_paid_media(context, chat_id, bc_id, star_count, media_list, caption):
-    """
-    Send a paid media bundle (photos or videos) gated by Telegram Stars.
-    Users pay star_count Stars to unlock all items.
-    """
-    paid_items = []
-    for item in media_list[:10]:  # Telegram cap: max 10 items
-        # Detect video by file extension or explicit "video:" prefix
-        if isinstance(item, str) and (
-            item.startswith("video:") or item.lower().endswith((".mp4", ".mov", ".avi"))
-        ):
-            media_url = item.replace("video:", "")
-            paid_items.append(InputPaidMediaVideo(media=media_url))
-        else:
-            paid_items.append(InputPaidMediaPhoto(media=item))
+    chat_id = message.chat_id
+    name    = sender.first_name or "there"
 
-    await context.bot.send_paid_media(
-        chat_id=chat_id,
-        star_count=star_count,
-        media=paid_items,
-        caption=caption,
-        business_connection_id=bc_id,
-        parse_mode=ParseMode.HTML,
-    )
+    try:
+        # ── Wait MSG_1_DELAY, then show typing + send message 1 ──────────
+        await asyncio.sleep(MSG_1_DELAY)
+        msg1 = MESSAGE_1.format(name=name)
+        await type_and_send(context, chat_id, bc_id, msg1)
+
+        # ── Wait MSG_2_DELAY, then show typing + send message 2 ──────────
+        await asyncio.sleep(MSG_2_DELAY)
+        msg2 = MESSAGE_2.format(name=name)
+        await type_and_send(context, chat_id, bc_id, msg2)
+
+        logger.info(f"✅ Auto-reply sequence complete for user {sender.id}")
+
+    except TelegramError as e:
+        logger.error(f"Failed to send auto-reply to {sender.id}: {e}")
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -228,12 +171,21 @@ async def send_paid_media(context, chat_id, bc_id, star_count, media_list, capti
 # ════════════════════════════════════════════════════════════════════════
 
 def is_admin(user_id: int) -> bool:
-    admin_id = os.getenv("ADMIN_ID", "")
-    return str(user_id) == admin_id
+    return str(user_id) == os.getenv("ADMIN_ID", "")
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 <b>Business Bot is live!</b>\n\n"
+        "Connect via: <i>Settings → Business → Chatbots</i>\n\n"
+        "Commands:\n"
+        "• /stats — view statistics\n"
+        "• /broadcast — message all users",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/stats — show bot statistics (admin only)"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Access denied.")
         return
@@ -241,118 +193,68 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db: Database = context.bot_data["db"]
     s = db.get_stats()
 
-    text = (
+    await update.message.reply_text(
         "📊 <b>Bot Statistics</b>\n"
         "─────────────────────\n"
-        f"👥 Total users:       <b>{s['total_users']:,}</b>\n"
-        f"🆕 New today:         <b>{s['new_today']:,}</b>\n"
-        f"📅 New this week:     <b>{s['new_this_week']:,}</b>\n"
-        f"💬 Total messages:    <b>{s['total_messages']:,}</b>\n"
-        f"📣 Broadcasts sent:   <b>{s['total_broadcasts']:,}</b>\n"
-        f"🔗 Active connections:<b>{len(active_connections)}</b>"
+        f"👥 Total users:        <b>{s['total_users']:,}</b>\n"
+        f"🆕 New today:          <b>{s['new_today']:,}</b>\n"
+        f"📅 New this week:      <b>{s['new_this_week']:,}</b>\n"
+        f"💬 Total messages:     <b>{s['total_messages']:,}</b>\n"
+        f"📣 Broadcasts sent:    <b>{s['total_broadcasts']:,}</b>\n"
+        f"🔗 Active connections: <b>{len(active_connections)}</b>",
+        parse_mode=ParseMode.HTML,
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /broadcast <message>
-    Sends a message to every user who has ever messaged the business account.
-    Admin only.
-    """
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Access denied.")
         return
 
     if not context.args:
         await update.message.reply_text(
-            "📣 <b>Broadcast Usage</b>\n\n"
-            "<code>/broadcast Your message here</code>\n\n"
-            "Supports HTML formatting:\n"
-            "<code>/broadcast &lt;b&gt;Bold text&lt;/b&gt; — announcement!</code>",
+            "📣 <b>Usage:</b> <code>/broadcast Your message here</code>\n\n"
+            "Supports HTML: <code>&lt;b&gt;bold&lt;/b&gt;</code>, "
+            "<code>&lt;i&gt;italic&lt;/i&gt;</code>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    broadcast_text = " ".join(context.args)
+    text = " ".join(context.args)
     db: Database = context.bot_data["db"]
     user_ids = db.get_all_user_ids()
 
     if not user_ids:
-        await update.message.reply_text("📭 No users to broadcast to yet.")
+        await update.message.reply_text("📭 No users yet.")
         return
 
-    status_msg = await update.message.reply_text(
-        f"📣 Broadcasting to {len(user_ids):,} users..."
+    status = await update.message.reply_text(
+        f"📣 Broadcasting to <b>{len(user_ids):,}</b> users...",
+        parse_mode=ParseMode.HTML,
     )
 
-    sent = 0
-    failed = 0
-
+    sent, failed = 0, 0
     for uid in user_ids:
         try:
             await context.bot.send_message(
-                chat_id=uid,
-                text=broadcast_text,
-                parse_mode=ParseMode.HTML,
+                chat_id=uid, text=text, parse_mode=ParseMode.HTML
             )
             sent += 1
         except Forbidden:
-            failed += 1  # User blocked the bot
+            failed += 1
         except TelegramError as e:
             logger.warning(f"Broadcast failed for {uid}: {e}")
             failed += 1
+        await asyncio.sleep(0.05)   # ~20 msg/sec — safe rate limit
 
-        # Respect Telegram rate limits (30 msg/sec to different users)
-        await asyncio.sleep(0.05)
+    db.log_broadcast(update.effective_user.id, text, sent, failed)
 
-    db.log_broadcast(
-        admin_id=update.effective_user.id,
-        message=broadcast_text,
-        sent=sent,
-        failed=failed,
-    )
-
-    await status_msg.edit_text(
+    await status.edit_text(
         f"✅ <b>Broadcast complete!</b>\n\n"
         f"📤 Sent:   <b>{sent:,}</b>\n"
         f"❌ Failed: <b>{failed:,}</b>",
         parse_mode=ParseMode.HTML,
     )
-
-
-async def sequence_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/sequence — show the current reply sequence (admin only)"""
-    if not is_admin(update.effective_user.id):
-        return
-
-    lines = ["🔁 <b>Current Reply Sequence</b>\n"]
-    for step in REPLY_SEQUENCE:
-        t = step.get("type", "text")
-        icon = {"text": "💬", "photo": "🖼️", "paid_media": "🔒"}.get(t, "❓")
-        delay = step.get("delay", 0)
-        extra = ""
-        if t == "paid_media":
-            extra = f" | ⭐ {step.get('star_count', '?')} Stars | {len(step.get('media', []))} item(s)"
-        lines.append(
-            f"{icon} Step {step['step']}: <b>{t}</b> (delay: {delay}s{extra})"
-        )
-
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/start — welcome message"""
-    text = (
-        "👋 <b>Business Bot is running!</b>\n\n"
-        "Connect me to your Telegram Business account:\n"
-        "<i>Settings → Business → Chatbots</i>\n\n"
-        "Admin commands:\n"
-        "• /stats — view statistics\n"
-        "• /broadcast — message all users\n"
-        "• /sequence — view reply sequence"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -362,39 +264,22 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
-        raise ValueError("BOT_TOKEN is not set in .env")
+        raise ValueError("BOT_TOKEN not set in .env")
 
-    db = Database()
-
-    app = (
-        ApplicationBuilder()
-        .token(token)
-        .post_init(on_startup)
-        .build()
-    )
-
-    # Share DB instance across all handlers
+    db  = Database()
+    app = ApplicationBuilder().token(token).post_init(on_startup).build()
     app.bot_data["db"] = db
 
-    # ── Handlers ──────────────────────────────────────────────────────────
     app.add_handler(BusinessConnectionHandler(handle_business_connection))
-
-    # Business messages (incoming messages from users to business account)
     app.add_handler(
         MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, handle_business_message)
     )
-
-    # Admin commands
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("start",     start_command))
+    app.add_handler(CommandHandler("stats",     stats_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
-    app.add_handler(CommandHandler("sequence", sequence_command))
 
-    logger.info("🤖 Bot starting — polling for updates...")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    logger.info("🤖 Bot is running...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
