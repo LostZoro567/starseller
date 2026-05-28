@@ -28,11 +28,11 @@ MSG_2_DELAY   = 6    # wait after first message before second
 TYPING_SPEED  = 18   # lower = slower typer, higher = faster
 
 # ── Message 1 — warm, human acknowledgment ───────────────────────────────────
-MESSAGE_1 = "Hey! Got your message 👋 give me a moment"
+MESSAGE_1 = "Hey! Got your message 👋"
 
 # ── Message 2 — casual redirect (add your bot link below) ────────────────────
 MESSAGE_2 = (
-    "Btw just dropped something new — not gonna be up for long\n"
-    "→ @YOUR_BOT_HERE\n"
+    "Btw just dropped something new — Best collection in telergam\n"
+    "→ https://t.me/Bestcollectionstuff_bot\n"
     "Lmk if you grab it 🔥"
 )
